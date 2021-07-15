@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
-use format::Result;
+use format::{FileChunk, Result};
 use oci::Image;
 
 use super::puzzlefs::{FileReader, Inode, InodeMode, PuzzleFS};

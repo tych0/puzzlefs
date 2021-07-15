@@ -2,6 +2,7 @@ use std::cmp::min;
 use std::convert::TryFrom;
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::path::Component;
 
 use nix::errno::Errno;
 
@@ -179,6 +180,25 @@ impl<'a> PuzzleFS<'a> {
 
         Ok(max)
     }
+
+    // lookup implements a full path lookup in a puzzlefs filesystem system, returning both the
+    // that directory listing for the inode of the directory that contains the path and the Inode
+    // itself (which may also be an InodeMode::Dir). It returns None if the path is not present.
+    /*
+    pub fn lookup(path: &Path) -> Result<Option<(Vec<(OsString, Ino)>, Inode)>> {
+        let root = self.find_inode(1)?;
+        let mut parent = if let InodeMode::Dir { ref entries } = root.inode.mode {
+                entries
+            } else {
+                return WireFormatError::from_errno(Errno::ENOTDIR)
+            };
+        for (pos, component) in path.components().enumerate() {
+            match component {
+                Component::RootDir
+            }
+        }
+    }
+    */
 }
 
 pub struct FileReader<'a> {

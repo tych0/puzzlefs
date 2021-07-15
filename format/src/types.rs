@@ -78,6 +78,13 @@ pub struct BlobRef {
 }
 
 impl BlobRef {
+    fn local(&self, offset: u64) -> Self {
+        BlobRef {
+            offset,
+            kind: BlobRefKind::Local,
+        }
+    }
+
     fn fixed_length_serialize(&self, state: &mut [u8; BLOB_REF_SIZE]) {
         state[0..8].copy_from_slice(&self.offset.to_le_bytes());
         match self.kind {
@@ -349,73 +356,6 @@ impl<'de> Deserialize<'de> for Inode {
 }
 
 impl Inode {
-    pub fn new_dir(
-        ino: Ino,
-        md: &fs::Metadata,
-        dir_list: u64,
-        additional: Option<BlobRef>,
-    ) -> io::Result<Self> {
-        if !md.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("{} is a dir", ino),
-            ));
-        }
-
-        let mode = InodeMode::Dir { offset: dir_list };
-        Ok(Self::new_inode(ino, md, mode, additional))
-    }
-
-    pub fn new_file(
-        ino: Ino,
-        md: &fs::Metadata,
-        chunk_list: u64,
-        additional: Option<BlobRef>,
-    ) -> io::Result<Self> {
-        if !md.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("{} is a file", ino),
-            ));
-        }
-
-        let mode = InodeMode::Reg { offset: chunk_list };
-        Ok(Self::new_inode(ino, md, mode, additional))
-    }
-
-    pub fn new_other(ino: Ino, md: &fs::Metadata, additional: Option<BlobRef>) -> io::Result<Self> {
-        let file_type = md.file_type();
-        let mode = if file_type.is_fifo() {
-            InodeMode::Fifo
-        } else if file_type.is_char_device() {
-            let major = stat::major(md.rdev());
-            let minor = stat::minor(md.rdev());
-            InodeMode::Chr { major, minor }
-        } else if file_type.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("{} is a dir", ino),
-            ));
-        } else if file_type.is_block_device() {
-            let major = stat::major(md.rdev());
-            let minor = stat::minor(md.rdev());
-            InodeMode::Blk { major, minor }
-        } else if file_type.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("{} is a file", ino),
-            ));
-        } else if file_type.is_symlink() {
-            InodeMode::Lnk
-        } else if file_type.is_socket() {
-            InodeMode::Sock
-        } else {
-            InodeMode::Unknown
-        };
-
-        Ok(Self::new_inode(ino, md, mode, additional))
-    }
-
     fn new_inode(
         ino: Ino,
         md: &fs::Metadata,

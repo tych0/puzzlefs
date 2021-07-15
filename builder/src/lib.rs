@@ -5,14 +5,16 @@ use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
+use nix::errno::Errno;
 use walkdir::WalkDir;
 
 use format::{
-    BlobRef, BlobRefKind, DirEnt, DirList, FileChunk, FileChunkList, Ino, Inode, InodeAdditional,
+    BlobRef, BlobRefKind, DirEnt, DirList, FileChunk, FileChunkList, Ino, Inode, InodeAdditional, InodeMode,
     Result, Rootfs,
 };
 use oci::media_types;
 use oci::{Descriptor, Image};
+use reader::PuzzleFS;
 
 mod fastcdc_fs;
 use fastcdc_fs::{ChunkWithData, FastCDCWrapper};
@@ -27,26 +29,206 @@ fn walker(rootfs: &Path) -> WalkDir {
         .sort_by(|a, b| a.file_name().cmp(b.file_name()))
 }
 
-// a struct to hold a directory's information before it can be rendered into a InodeSpecific::Dir
-// (aka the offset is unknown because we haven't accumulated all the inodes yet)
+fn generate_inodes_and_chunks(rootfs: &Path, oci: &Image) -> Result<Vec<InodeInfo>> {
+    // TODO: ideally we'd not keep this whole setup in memory; however, we have to know the number
+    // of inodes we're going to write for this metadata block so we can correctly compute offsets
+    // for things that come after the inode list. Maybe we should just use non-local blob refs for
+    // metadata? or maybe we should do away with fixed length inode encoding all together?
+
+    // host to puzzlefs inode mapping for hard link deteciton
+    let mut host_to_pfs = HashMap::<u64, Ino>::new();
+
+    // any previous files which were not included in a chunk
+    let mut prev_files = Vec::<ModeInfo>::new();
+    let mut inodes = Vec::<InodeInfo>::new();
+
+    let mut fcdc = FastCDCWrapper::new();
+
+    let cur_ino = 1;
+
+    for entry in walker(rootfs) {
+        let e = entry.map_err(io::Error::from)?;
+        let md = e.metadata().map_err(io::Error::from)?;
+
+        // now that we know the ino of this thing, let's put it in the parent directory (assuming
+        // this is not "/" for our image, aka inode #1)
+        if cur_ino != 1 {
+            // is this a hard link? if so, just use the existing ino we have rendered. otherewise,
+            // use a new one
+            let the_ino = host_to_pfs.get(&md.ino()).copied().unwrap_or(cur_ino);
+            let parent_path = e.path().parent().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("no parent for {}", e.path().display()),
+                )
+            })?;
+            let parent = inodes
+                .get_mut(&fs::symlink_metadata(parent_path)?.ino())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("no pfs inode for {}", e.path().display()),
+                    )
+                })?;
+            parent.add_entry(e.path(), the_ino)?;
+
+            // if it was a hard link, we don't need to actually render it again
+            if host_to_pfs.get(&md.ino()).is_some() {
+                continue;
+            }
+        }
+
+        host_to_pfs.insert(md.ino(), cur_ino);
+
+        let additional = InodeAdditional::new(e.path(), &md)?;
+        let mode =
+            if md.is_dir() {
+                ModeInfo::Dir { dir_list: DirList { entries: Vec::<DirEnt>::new()}};
+            } else if md.is_file() {
+                let mut f = fs::File::open(e.path())?;
+                io::copy(&mut f, &mut fcdc)?;
+                let mut written_chunks = write_chunks_to_oci(oci, &mut fcdc)?;
+
+                let mut chunks = Vec::<FileChunk>::new();
+                let file = ModeInfo::File { chunk_list: FileChunkList { chunks }};
+                if written_chunks.is_empty() {
+                    // this file wasn't big enough to cause a chunk to be generated, add it to the list
+                    // of files pending for this chunk
+                    prev_files.push(file);
+                } else {
+                    let fixed_chunk =
+                        merge_chunks_and_prev_files(&mut written_chunks, &mut files, &mut prev_files)?;
+                    chunks.push(fixed_chunk);
+                    chunks.append(&mut written_chunks);
+                }
+
+                file
+            } else {
+                ModeInfo::Other
+            };
+        let inode = InodeInfo { ino: cur_ino, addiitonal, md, mode };
+        inodes.push(inode);
+
+        cur_ino += 1;
+    }
+
+    // all inodes done, we need to finish up the cdc chunking
+    fcdc.finish();
+    let mut written_chunks = write_chunks_to_oci(oci, &mut fcdc)?;
+
+    // if we have chunks, we should have files too
+    assert!(written_chunks.is_empty() || !prev_files.is_empty());
+    assert!(!written_chunks.is_empty() || prev_files.is_empty());
+
+    if !written_chunks.is_empty() {
+        // merge everything leftover with all previous files. we expect an error here, since the in
+        // put shoudl be exactly consumed and the final take_first_chunk() call should fail. TODO:
+        // rearrange this to be less ugly.
+        merge_chunks_and_prev_files(&mut written_chunks, &mut files, &mut prev_files).unwrap_err();
+
+        // we should have consumed all the chunks.
+        assert!(written_chunks.is_empty());
+    }
+    inodes.sort_by(|a, b| a.ino.cmp(&b.ino));
+    Ok(inodes)
+}
+
+// a struct to hold an inode's information before it can be rendered into a format::Inode (e.g. the
+// dir/chunk list offset is unknown because we haven't accumulated all the dir entries yet)
+struct InodeInfo {
+    ino: u64,
+    additional: Option<InodeAdditional>,
+    md: fs::Metadata,
+    mode: ModeInfo,
+}
+
+impl InodeInfo {
+    fn render(&self, inode_buf: &mut Vec<u8>, total_inode_size: u64, other_buf: &mut Vec<u8>) -> Result<()> {
+        let additional_ref = d
+            .additional
+            .as_ref()
+            .map::<Result<BlobRef>, _>(|add| {
+                let br = BlobRef::local(total_inode_size + other_buf.len());
+                serde_cbor::to_writer(&mut other_buf, &add)?;
+                Ok(br)
+            })
+            .transpose()?;
+        let mode = mode.render(&self.md, total_inode_size + other_buf.len(), other_buf)?;
+        Inode::new_inode(self.ino, &self.md, mode, additional_ref)
+    }
+}
+
+enum ModeInfo {
+    Dir { dir_list: DirList },
+    File { chunk_list: FileChunkList },
+    Other,
+}
+
+impl ModeInfo {
+    fn render(&self, md: &fs::Metadata, offset: u64, mut w: dyn io::Writer) -> Result<InodeMode> {
+        let mode = match self {
+            ModeInfo::Dir { dir_list } => {
+                serde_cbor::to_writer(&mut w, dir_list)?;
+                InodeMode::Dir { offset }
+            },
+            ModeInfo::File { chunk_list } => {
+                serde_cbor::to_writer(&mut w, chunk_list)?;
+                InodeMode::Reg { offset }
+            },
+            ModeInfo::Other => {
+                if md.file_type().is_fifo() {
+                    InodeMode::Fifo
+                } else if md.file_type().is_char_device() {
+                    let major = stat::major(md.rdev());
+                    let minor = stat::minor(md.rdev());
+                    InodeMode::Chr { major, minor }
+                } else if md.file_type().is_block_device() {
+                    let major = stat::major(md.rdev());
+                    let minor = stat::minor(md.rdev());
+                    InodeMode::Blk { major, minor }
+                } else if md.file_type().is_symlink() {
+                    InodeMode::Lnk
+                } else if md.file_type().is_socket() {
+                    InodeMode::Sock
+                } else {
+                    // "should never" happen
+                    panic!("invalid other type: {:?}", md);
+                }
+            }
+        };
+        Ok(mode)
+    }
+
+    fn add_entry(&mut self, p: &Path, ino: Ino) -> Result<()> {
+        if let ModeInfo::Dir { mut dir_list } = self {
+            let name = p.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Other, format!("no path for {}", p.display()))
+            })?;
+            self.dir_list.entries.push(DirEnt {
+                name: name.to_os_string(),
+                ino,
+            });
+            Ok(())
+        } else {
+            Err(WireFormatError::from_errno(Errno::ENOTDIR))
+        }
+    }
+
+    fn add_chunk(&mut self, chunk: FileChunk) -> Result<()> {
+        if let ModeInfo::File { mut chunk_list } = self {
+            chunk_list.push(chunk);
+            Ok(())
+        } else {
+            Err(WireFormatError::from_errno(Errno::EISDIR))
+        }
+    }
+}
+
 struct Dir {
     ino: u64,
     dir_list: DirList,
     md: fs::Metadata,
     additional: Option<InodeAdditional>,
-}
-
-impl Dir {
-    fn add_entry(&mut self, p: &Path, ino: Ino) -> io::Result<()> {
-        let name = p.file_name().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, format!("no path for {}", p.display()))
-        })?;
-        self.dir_list.entries.push(DirEnt {
-            name: name.to_os_string(),
-            ino,
-        });
-        Ok(())
-    }
 }
 
 // similar to the above, but holding file metadata
@@ -138,128 +320,17 @@ fn inode_encoded_size(num_inodes: usize) -> usize {
 }
 
 pub fn build_initial_rootfs(rootfs: &Path, oci: &Image) -> Result<Descriptor> {
-    let mut dirs = HashMap::<u64, Dir>::new();
-    let mut files = Vec::<File>::new();
-    let mut others = Vec::<Other>::new();
-    let mut pfs_inodes = Vec::<Inode>::new();
-
-    // host to puzzlefs inode mapping for hard link deteciton
-    let mut host_to_pfs = HashMap::<u64, Ino>::new();
-
-    let mut cur_ino: u64 = 1;
-
-    let mut fcdc = FastCDCWrapper::new();
-    let mut prev_files = Vec::<File>::new();
-
-    for entry in walker(rootfs) {
-        let e = entry.map_err(io::Error::from)?;
-        let md = e.metadata().map_err(io::Error::from)?;
-
-        // now that we know the ino of this thing, let's put it in the parent directory (assuming
-        // this is not "/" for our image, aka inode #1)
-        if cur_ino != 1 {
-            // is this a hard link? if so, just use the existing ino we have rendered. otherewise,
-            // use a new one
-            let the_ino = host_to_pfs.get(&md.ino()).copied().unwrap_or(cur_ino);
-            let parent_path = e.path().parent().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("no parent for {}", e.path().display()),
-                )
-            })?;
-            let parent = dirs
-                .get_mut(&fs::symlink_metadata(parent_path)?.ino())
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("no pfs inode for {}", e.path().display()),
-                    )
-                })?;
-            parent.add_entry(e.path(), the_ino)?;
-
-            // if it was a hard link, we don't need to actually render it again
-            if host_to_pfs.get(&md.ino()).is_some() {
-                continue;
-            }
-        }
-
-        host_to_pfs.insert(md.ino(), cur_ino);
-
-        // render as much of the inode as we can
-        let additional = InodeAdditional::new(e.path(), &md)?;
-        if md.is_dir() {
-            dirs.insert(
-                md.ino(),
-                Dir {
-                    ino: cur_ino,
-                    md,
-                    dir_list: DirList {
-                        entries: Vec::<DirEnt>::new(),
-                        look_below: false,
-                    },
-                    additional,
-                },
-            );
-        } else if md.is_file() {
-            let mut f = fs::File::open(e.path())?;
-            io::copy(&mut f, &mut fcdc)?;
-
-            let mut written_chunks = write_chunks_to_oci(oci, &mut fcdc)?;
-            let mut file = File {
-                ino: cur_ino,
-                md,
-                chunk_list: FileChunkList {
-                    chunks: Vec::<FileChunk>::new(),
-                },
-                additional,
-            };
-
-            if written_chunks.is_empty() {
-                // this file wasn't big enough to cause a chunk to be generated, add it to the list
-                // of files pending for this chunk
-                prev_files.push(file);
-            } else {
-                let fixed_chunk =
-                    merge_chunks_and_prev_files(&mut written_chunks, &mut files, &mut prev_files)?;
-                file.chunk_list.chunks.push(fixed_chunk);
-                file.chunk_list.chunks.append(&mut written_chunks);
-            }
-        } else {
-            let o = Other {
-                ino: cur_ino,
-                md,
-                additional,
-            };
-            others.push(o);
-        }
-
-        cur_ino += 1;
-    }
-
-    // all inodes done, we need to finish up the cdc chunking
-    fcdc.finish();
-    let mut written_chunks = write_chunks_to_oci(oci, &mut fcdc)?;
-
-    // if we have chunks, we should have files too
-    assert!(written_chunks.is_empty() || !prev_files.is_empty());
-    assert!(!written_chunks.is_empty() || prev_files.is_empty());
-
-    if !written_chunks.is_empty() {
-        // merge everything leftover with all previous files. we expect an error here, since the in
-        // put shoudl be exactly consumed and the final take_first_chunk() call should fail. TODO:
-        // rearrange this to be less ugly.
-        merge_chunks_and_prev_files(&mut written_chunks, &mut files, &mut prev_files).unwrap_err();
-
-        // we should have consumed all the chunks.
-        assert!(written_chunks.is_empty());
-    }
+    let inode_infos = generate_inodes_and_chunks(rootfs, oci)?;
 
     // total inode serailized size
-    let num_inodes = pfs_inodes.len() + dirs.len() + files.len() + others.len();
-    let inodes_serial_size = inode_encoded_size(num_inodes);
+    let inodes_serial_size = inode_encoded_size(inode_infos.len());
 
-    // TODO: not render this whole thing in memory, stick it all in the same blob, etc.
-    let mut dir_buf = Vec::<u8>::new();
+    let inode_buf = Vec::<u8>::with_capacity(inodes_serial_size);
+    let other_buf = Vec::<u8>::new();
+
+    let inodes = inode_infos.drain(..).map(|i| {
+        i.render()
+    }).collect::<Result<Vec<Inode>>>()?;
 
     // render dirs
     pfs_inodes.extend(
@@ -269,18 +340,6 @@ pub fn build_initial_rootfs(rootfs: &Path, oci: &Image) -> Result<Descriptor> {
             .map(|d| {
                 let dir_list_offset = inodes_serial_size + dir_buf.len();
                 serde_cbor::to_writer(&mut dir_buf, &d.dir_list)?;
-                let additional_ref = d
-                    .additional
-                    .as_ref()
-                    .map::<Result<BlobRef>, _>(|add| {
-                        let offset = inodes_serial_size + dir_buf.len();
-                        serde_cbor::to_writer(&mut dir_buf, &add)?;
-                        Ok(BlobRef {
-                            offset: offset as u64,
-                            kind: BlobRefKind::Local,
-                        })
-                    })
-                    .transpose()?;
                 Ok(Inode::new_dir(
                     d.ino,
                     &d.md,
@@ -346,7 +405,6 @@ pub fn build_initial_rootfs(rootfs: &Path, oci: &Image) -> Result<Descriptor> {
             .collect::<Result<Vec<Inode>>>()?,
     );
 
-    pfs_inodes.sort_by(|a, b| a.ino.cmp(&b.ino));
 
     let mut md_buf = Vec::<u8>::with_capacity(
         inodes_serial_size + dir_buf.len() + files_buf.len() + others_buf.len(),
@@ -371,6 +429,28 @@ pub fn build_initial_rootfs(rootfs: &Path, oci: &Image) -> Result<Descriptor> {
     let mut rootfs_buf = Vec::new();
     serde_cbor::to_writer(&mut rootfs_buf, &Rootfs { metadatas })?;
     oci.put_blob::<_, compression::Noop, media_types::Rootfs>(rootfs_buf.as_slice())
+}
+
+// add_delta_to_image generates a filesystem delta based on a full rootfs and an overlay workdir
+// and adds it to the specified tag.
+pub fn add_delta_to_image(full_rootfs: &Path, delta: &Path, oci: &Image, tag: &String) -> Result<Descriptor> {
+    // Algorithm for adding a delta:
+    //     1. generate a complete FCDC chunking of the new rootfs
+    //     2. during this, keep track of what is present, what has been deleted
+    //     3. for each thing that has been deleted, add a WHT inode in the filesystem.
+    //     4. for each thing that is present
+    //           if the chunk list is unchanged:
+    //               continue
+    //           render the new inode with only the delta
+    let mut pfs = PuzzleFS::open(oci, tag)?;
+    let mut cur_ino = pfs.max_inode()? + 1;
+
+    for d in walker(delta) {
+        let e = entry.map_err(io::Error::from)?;
+        let md = e.metadata().map_err(io::Error::from)?;
+
+        
+    }
 }
 
 // TODO: figure out how to guard this with #[cfg(test)]
